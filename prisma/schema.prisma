@@ -1,0 +1,657 @@
+// ReputeIQ — data model
+//
+// Tenancy rule: every row holding customer data reaches an Organization in at
+// most two hops, and every query in the app filters by an organization id
+// derived from the session (never from user input). See docs/architecture.md §6.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum ReviewProviderKey {
+  DEMO
+  CSV_IMPORT
+  GOOGLE_BUSINESS_PROFILE
+  YELP
+  FACEBOOK
+  TRIPADVISOR
+}
+
+enum SourceStatus {
+  CONNECTED
+  DISCONNECTED
+  ERROR
+}
+
+enum Sentiment {
+  POSITIVE
+  NEUTRAL
+  NEGATIVE
+}
+
+enum Urgency {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum RecommendationStatus {
+  OPEN
+  IN_PROGRESS
+  DONE
+  DISMISSED
+}
+
+enum AlertType {
+  NEGATIVE_SPIKE
+  RATING_DROP
+  NEW_RECURRING_COMPLAINT
+  CRITICAL_REVIEW
+  VOLUME_DROP
+}
+
+enum AlertStatus {
+  NEW
+  ACKNOWLEDGED
+  RESOLVED
+}
+
+enum ReportType {
+  WEEKLY
+  MONTHLY
+}
+
+enum ReportStatus {
+  PENDING
+  GENERATING
+  READY
+  FAILED
+}
+
+enum Plan {
+  STARTER
+  GROWTH
+  PRO
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+}
+
+enum UsageKind {
+  REVIEW_INGESTED
+  AI_ANALYSIS
+  REPORT_GENERATED
+  EMAIL_SENT
+}
+
+enum JobStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy
+// ---------------------------------------------------------------------------
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships  Membership[]
+  businesses   Business[]
+  subscription Subscription?
+  usageRecords UsageRecord[]
+
+  @@map("organizations")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships Membership[]
+  sessions    Session[]
+
+  @@map("users")
+}
+
+model Membership {
+  id             String   @id @default(cuid())
+  userId         String
+  organizationId String
+  role           Role     @default(OWNER)
+  createdAt      DateTime @default(now())
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+  @@map("memberships")
+}
+
+/// Opaque server-side sessions. Only the sha256 hash of the cookie token is
+/// stored, so database read access does not yield usable sessions.
+model Session {
+  id         String   @id @default(cuid())
+  userId     String
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+  userAgent  String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+// ---------------------------------------------------------------------------
+// Businesses
+// ---------------------------------------------------------------------------
+
+model Business {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  industry       String
+  website        String?
+  timezone       String   @default("America/New_York")
+  /// True for seeded demo businesses. The UI banners these and no code path
+  /// mixes demo and real reviews within one business.
+  isDemo         Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization    Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  locations       Location[]
+  reviewSources   ReviewSource[]
+  reviews         Review[]
+  topics          ReviewTopic[]
+  competitors     Competitor[]
+  recommendations Recommendation[]
+  alertRules      AlertRule[]
+  alerts          Alert[]
+  reports         Report[]
+  reportSchedules ReportSchedule[]
+  snapshots       ReputationSnapshot[]
+  usageRecords    UsageRecord[]
+  jobRuns         JobRun[]
+
+  @@index([organizationId])
+  @@map("businesses")
+}
+
+model Location {
+  id           String   @id @default(cuid())
+  businessId   String
+  label        String
+  addressLine1 String?
+  city         String?
+  region       String?
+  postalCode   String?
+  country      String   @default("US")
+  latitude     Float?
+  longitude    Float?
+  createdAt    DateTime @default(now())
+
+  business      Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  reviewSources ReviewSource[]
+
+  @@index([businessId])
+  @@map("locations")
+}
+
+/// A connected place reviews come from. `config` holds non-secret provider
+/// settings; `credentials` holds OAuth tokens and is never sent to the client.
+model ReviewSource {
+  id                String            @id @default(cuid())
+  businessId        String
+  locationId        String?
+  provider          ReviewProviderKey
+  displayName       String
+  externalAccountId String?
+  status            SourceStatus      @default(CONNECTED)
+  isDemo            Boolean           @default(false)
+  config            Json?
+  credentials       Json?
+  syncCursor        String?
+  lastSyncedAt      DateTime?
+  lastError         String?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  location Location? @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  reviews  Review[]
+
+  @@unique([businessId, provider, externalAccountId])
+  @@index([businessId])
+  @@map("review_sources")
+}
+
+// ---------------------------------------------------------------------------
+// Reviews and analysis
+// ---------------------------------------------------------------------------
+
+/// Immutable facts from a provider. Derived conclusions live in ReviewAnalysis.
+model Review {
+  id               String            @id @default(cuid())
+  businessId       String
+  reviewSourceId   String
+  provider         ReviewProviderKey
+  externalReviewId String
+  /// Public display name only. There is deliberately no column for reviewer
+  /// email, phone, address, or platform user id.
+  reviewerName     String?
+  rating           Int
+  text             String
+  reviewedAt       DateTime
+  url              String?
+  language         String            @default("en")
+  responseText     String?
+  respondedAt      DateTime?
+  /// sha256 of provider + normalized text + rating + date. Catches providers
+  /// that reissue the same review under a new external id.
+  contentHash      String
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  business Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  source   ReviewSource    @relation(fields: [reviewSourceId], references: [id], onDelete: Cascade)
+  analysis ReviewAnalysis?
+
+  /// Ingestion idempotency key.
+  @@unique([reviewSourceId, externalReviewId])
+  /// Indexed, deliberately not unique: contentHash is a heuristic for "the
+  /// provider reissued this review under a new id", and two different people
+  /// can legitimately post identical short text on the same day. The dedupe
+  /// decision is made in src/lib/ingestion/ingest.ts where it can be applied
+  /// with judgement rather than by aborting a write.
+  @@index([businessId, contentHash])
+  @@index([businessId, reviewedAt])
+  @@index([businessId, rating])
+  @@map("reviews")
+}
+
+model ReviewAnalysis {
+  id             String    @id @default(cuid())
+  reviewId       String    @unique
+  businessId     String
+  sentiment      Sentiment
+  /// -1.0 .. 1.0
+  sentimentScore Float
+  urgency        Urgency
+  summary        String
+  problems       String[]
+  strengths      String[]
+  suggestedReply String?
+  /// True when the text mentions something that may carry safety, legal, or
+  /// reputational exposure. Flag only — the product draws no legal or medical
+  /// conclusions and says so in the UI.
+  riskFlagged    Boolean   @default(false)
+  riskCategories String[]
+  modelProvider  String
+  modelName      String
+  promptVersion  String
+  /// Full validated provider payload, kept for auditability and reprocessing.
+  raw            Json
+  analyzedAt     DateTime  @default(now())
+
+  review   Review               @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  mentions ReviewTopicMention[]
+
+  @@index([businessId, sentiment])
+  @@index([businessId, urgency])
+  @@map("review_analyses")
+}
+
+/// Per-business topic dictionary. Seeded with cross-vertical starters; the AI
+/// may introduce new keys, which are upserted here with isCustom = true.
+model ReviewTopic {
+  id          String   @id @default(cuid())
+  businessId  String
+  key         String
+  label       String
+  description String?
+  isCustom    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  business Business             @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  mentions ReviewTopicMention[]
+
+  @@unique([businessId, key])
+  @@index([businessId])
+  @@map("review_topics")
+}
+
+model ReviewTopicMention {
+  id               String    @id @default(cuid())
+  reviewAnalysisId String
+  reviewTopicId    String
+  businessId       String
+  sentiment        Sentiment
+  sentimentScore   Float
+  /// 0..1 — how sure the analyzer is the topic is present.
+  confidence       Float
+  /// 0..1 — how central the topic is to the review.
+  importance       Float
+  /// The span of review text that triggered this topic. Makes every insight
+  /// clickable back to its source.
+  excerpt          String?
+
+  analysis ReviewAnalysis @relation(fields: [reviewAnalysisId], references: [id], onDelete: Cascade)
+  topic    ReviewTopic    @relation(fields: [reviewTopicId], references: [id], onDelete: Cascade)
+
+  @@unique([reviewAnalysisId, reviewTopicId])
+  @@index([businessId, reviewTopicId])
+  @@map("review_topic_mentions")
+}
+
+// ---------------------------------------------------------------------------
+// Competitors
+// ---------------------------------------------------------------------------
+
+model Competitor {
+  id           String            @id @default(cuid())
+  businessId   String
+  name         String
+  city         String?
+  region       String?
+  provider     ReviewProviderKey
+  externalId   String?
+  /// Rating and count as published by the provider, not recomputed by us.
+  ratingAvg    Float?
+  reviewCount  Int?
+  isDemo       Boolean           @default(false)
+  lastSyncedAt DateTime?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  business Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  reviews  CompetitorReview[]
+
+  @@unique([businessId, provider, externalId])
+  @@index([businessId])
+  @@map("competitors")
+}
+
+/// Competitors are only ever compared in aggregate, so analysis is stored flat
+/// here rather than through the full ReviewAnalysis + mention tables.
+model CompetitorReview {
+  id               String            @id @default(cuid())
+  competitorId     String
+  provider         ReviewProviderKey
+  externalReviewId String
+  rating           Int
+  text             String
+  reviewedAt       DateTime
+  sentiment        Sentiment?
+  sentimentScore   Float?
+  topicKeys        String[]
+  contentHash      String
+  createdAt        DateTime          @default(now())
+
+  competitor Competitor @relation(fields: [competitorId], references: [id], onDelete: Cascade)
+
+  @@unique([competitorId, externalReviewId])
+  @@index([competitorId, reviewedAt])
+  @@map("competitor_reviews")
+}
+
+// ---------------------------------------------------------------------------
+// Outputs: recommendations, alerts, reports
+// ---------------------------------------------------------------------------
+
+model Recommendation {
+  id               String               @id @default(cuid())
+  businessId       String
+  title            String
+  problem          String
+  action           String
+  rationale        String
+  priority         Priority
+  /// Qualitative only. The product never claims a guaranteed financial impact.
+  expectedImpact   String
+  topicKey         String?
+  status           RecommendationStatus @default(OPEN)
+  /// Reviews that support this recommendation — the traceability link.
+  evidenceReviewIds String[]
+  /// Computed facts (counts, deltas) rendered by the UI. Never model output.
+  metrics          Json
+  periodStart      DateTime
+  periodEnd        DateTime
+  generatedAt      DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, status])
+  @@index([businessId, priority])
+  @@map("recommendations")
+}
+
+model AlertRule {
+  id           String    @id @default(cuid())
+  businessId   String
+  type         AlertType
+  enabled      Boolean   @default(true)
+  /// Interpretation depends on type: percent for spikes, rating points for
+  /// drops, mention count for recurring complaints.
+  threshold    Float
+  windowDays   Int       @default(30)
+  emailEnabled Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  alerts   Alert[]
+
+  @@unique([businessId, type])
+  @@index([businessId])
+  @@map("alert_rules")
+}
+
+model Alert {
+  id          String      @id @default(cuid())
+  businessId  String
+  alertRuleId String?
+  type        AlertType
+  severity    Priority
+  title       String
+  message     String
+  /// Computed values behind the alert, so the UI never restates a number the
+  /// data does not support.
+  metrics     Json
+  evidenceReviewIds String[]
+  status      AlertStatus @default(NEW)
+  /// Stable key identifying "this alert about this thing in this window", used
+  /// to avoid re-firing the same alert on every evaluation.
+  dedupeKey   String
+  triggeredAt DateTime    @default(now())
+  resolvedAt  DateTime?
+
+  business Business   @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  rule     AlertRule? @relation(fields: [alertRuleId], references: [id], onDelete: SetNull)
+
+  @@unique([businessId, dedupeKey])
+  @@index([businessId, status])
+  @@map("alerts")
+}
+
+model Report {
+  id              String       @id @default(cuid())
+  businessId      String
+  type            ReportType
+  periodStart     DateTime
+  periodEnd       DateTime
+  status          ReportStatus @default(PENDING)
+  reputationScore Int?
+  scoreDelta      Int?
+  summary         String?
+  /// Every figure the report renders, computed from the database.
+  metrics         Json?
+  error           String?
+  generatedAt     DateTime?
+  deliveredAt     DateTime?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  business Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  sections ReportSection[]
+
+  /// Report generation idempotency key.
+  @@unique([businessId, type, periodStart])
+  @@index([businessId, periodStart])
+  @@map("reports")
+}
+
+model ReportSection {
+  id       String @id @default(cuid())
+  reportId String
+  order    Int
+  key      String
+  title    String
+  body     String
+  data     Json?
+
+  report Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@unique([reportId, key])
+  @@index([reportId, order])
+  @@map("report_sections")
+}
+
+model ReportSchedule {
+  id             String     @id @default(cuid())
+  businessId     String
+  frequency      ReportType
+  /// 0 = Sunday. Used when frequency is WEEKLY.
+  dayOfWeek      Int        @default(1)
+  /// Used when frequency is MONTHLY.
+  dayOfMonth     Int        @default(1)
+  /// Local hour in the business timezone.
+  hour           Int        @default(8)
+  recipientEmail String
+  enabled        Boolean    @default(true)
+  lastRunAt      DateTime?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, frequency])
+  @@index([businessId])
+  @@map("report_schedules")
+}
+
+/// The score and its components as computed on a given day. This is what makes
+/// "up 4 points this month" a recorded fact rather than an estimate.
+model ReputationSnapshot {
+  id           String   @id @default(cuid())
+  businessId   String
+  capturedOn   DateTime @db.Date
+  score        Int
+  components   Json
+  avgRating    Float
+  reviewCount  Int
+  positiveRate Float
+  negativeRate Float
+  createdAt    DateTime @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, capturedOn])
+  @@index([businessId, capturedOn])
+  @@map("reputation_snapshots")
+}
+
+// ---------------------------------------------------------------------------
+// Billing and operations
+// ---------------------------------------------------------------------------
+
+model Subscription {
+  id                   String             @id @default(cuid())
+  organizationId       String             @unique
+  plan                 Plan               @default(STARTER)
+  status               SubscriptionStatus @default(TRIALING)
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+  currentPeriodEnd     DateTime?
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@map("subscriptions")
+}
+
+model UsageRecord {
+  id             String    @id @default(cuid())
+  organizationId String
+  businessId     String?
+  kind           UsageKind
+  quantity       Int       @default(1)
+  meta           Json?
+  occurredAt     DateTime  @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  business     Business?    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, kind, occurredAt])
+  @@map("usage_records")
+}
+
+model JobRun {
+  id         String    @id @default(cuid())
+  jobName    String
+  businessId String?
+  status     JobStatus @default(RUNNING)
+  stats      Json?
+  error      String?
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+
+  business Business? @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([jobName, startedAt])
+  @@map("job_runs")
+}
