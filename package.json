@@ -18,7 +18,9 @@
     "seed:demo": "NODE_OPTIONS='--conditions=react-server' tsx scripts/seed-demo.ts",
     "jobs:run": "NODE_OPTIONS='--conditions=react-server' tsx scripts/run-jobs.ts",
     "demo:prospect": "NODE_OPTIONS='--conditions=react-server' tsx scripts/prospect-demo.ts",
-    "export:report": "NODE_OPTIONS='--conditions=react-server' tsx scripts/export-report.ts"
+    "export:report": "NODE_OPTIONS='--conditions=react-server' tsx scripts/export-report.ts",
+    "onepager": "tsx scripts/one-pager.ts",
+    "website": "tsx scripts/website.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.0",
